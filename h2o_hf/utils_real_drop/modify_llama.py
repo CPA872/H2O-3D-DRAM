@@ -513,7 +513,7 @@ class H2OLlamaAttention(nn.Module):
         # Calculate timings
         timings = {op: events[op][0].elapsed_time(events[op][1]) for op in events.keys()}
         
-        print(f"[H2O Attention Profiling], input shape: {hidden_states.shape}")
+        print(f"[H2O Attention Profiling], input shape: {hidden_states.shape}, kv_shape: {key_states.shape}")
         print(f"  Total time: {timings['total']:.3f}ms")
         for op in events.keys():
             if op != 'total':
