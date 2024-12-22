@@ -6,7 +6,13 @@ HH_SIZE=$5
 RECENT_SIZE=$6
 
 if [[ ${method} == 'h2o' ]]; then
-    CUDA_VISIBLE_DEVICES=${GPU} python -u run_summarization.py \
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    ncu --set full -o profile_output \
+    --target-processes all \
+    --replay-mode application \
+    --kernel-name-base function \
+    --launch-skip-before-match 0 \
+    python -u run_summarization.py \
         --input_path data/summarization_data/${task}_${shots}shot.jsonl \
         --output_path summary_results/${task}_${shots}shot_h2o_hh${1}_local${2}.jsonl \
         --model_name meta-llama/Llama-2-7b-hf \

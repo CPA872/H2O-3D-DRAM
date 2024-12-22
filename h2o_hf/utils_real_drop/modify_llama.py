@@ -8,6 +8,8 @@ import torch.utils.checkpoint
 
 import torch.nn.functional as F
 
+from time import time, perf_counter
+
 # from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -192,17 +194,6 @@ class LlamaConfig(PretrainedConfig):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -239,6 +230,10 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     return x_embed
 
 
+attention_cost = {
+    
+}
+
 class H2OKVCache_LayerWise:
     def __init__(
         self,
@@ -247,7 +242,7 @@ class H2OKVCache_LayerWise:
         k_seq_dim=2,
         v_seq_dim=2,
     ):
-        print(f"H2OKVCache-LayerWise: {hh_size}, {recent_size}")
+        print(f"[CHECK] H2OLlamaAttention H2OKVCache-LayerWise: {hh_size}, {recent_size}")
         self.hh_size = hh_size
         self.recent_size = recent_size
         self.cache_size = hh_size + recent_size
@@ -403,53 +398,42 @@ class H2OLlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
+        # Create events for main compute-intensive operations
+        events = {op: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) 
+                 for op in ['total', 'qkv_proj', 'kv_concat', 
+                           'repeat_kv', 'attn_score', 'softmax', 
+                           'kv_select', 'attn_output', 'output_proj']}
+        
+        events['total'][0].record()
         bsz, q_len, _ = hidden_states.size()
-
+        
+        # QKV Projection
+        events['qkv_proj'][0].record()
         if self.config.pretraining_tp > 1:
-            key_value_slicing = (
-                self.num_key_value_heads * self.head_dim
-            ) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split((self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0)
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
-            query_states = [
-                F.linear(hidden_states, query_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
             query_states = torch.cat(query_states, dim=-1)
 
-            key_states = [
-                F.linear(hidden_states, key_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
             key_states = torch.cat(key_states, dim=-1)
 
-            value_states = [
-                F.linear(hidden_states, value_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
             value_states = torch.cat(value_states, dim=-1)
-
         else:
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
+        events['qkv_proj'][1].record()
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)
+        # Regular ops without timing
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # remake causal mask
         attention_mask = _make_causal_mask(
             bsz=bsz,
             tgt_len=q_len,
@@ -468,75 +452,74 @@ class H2OLlamaAttention(nn.Module):
                 position_length = position_ids.item()+1
 
         cos, sin = self.rotary_emb(value_states, seq_len=position_length)
-        ### Shift Pos: query pos is min(cache_size, idx)
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
 
+        # KV concatenation
+        events['kv_concat'][0].record()
         if past_key_value is not None:
-            # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
         past_key_value = (key_states, value_states) if use_cache else None
+        events['kv_concat'][1].record()
 
-        # repeat k/v heads if n_kv_heads < n_heads
+        # Repeat KV
+        events['repeat_kv'][0].record()
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        events['repeat_kv'][1].record()
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(
-            self.head_dim
-        )
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
+        # Attention score computation
+        events['attn_score'][0].record()
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
             attn_weights = attn_weights + attention_mask
+        events['attn_score'][1].record()
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-            query_states.dtype
-        )
+        # Softmax
+        events['softmax'][0].record()
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        events['softmax'][1].record()
 
+        # KV selection
+        events['kv_select'][0].record()
         past_key_value = self.kv_cache(past_key_value, attn_weights.detach().clone())
+        events['kv_select'][1].record()
 
+        # Attention output computation
+        events['attn_output'][0].record()
         attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        events['attn_output'][1].record()
 
+        # Output projection
+        events['output_proj'][0].record()
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(
-                self.hidden_size // self.config.pretraining_tp, dim=2
-            )
-            o_proj_slices = self.o_proj.weight.split(
-                self.hidden_size // self.config.pretraining_tp, dim=1
-            )
-            attn_output = sum(
-                [
-                    F.linear(attn_output[i], o_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ]
-            )
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
             attn_output = self.o_proj(attn_output)
+        events['output_proj'][1].record()
 
+        events['total'][1].record()
+        
         if not output_attentions:
             attn_weights = None
+
+        torch.cuda.synchronize()
+        
+        # Calculate timings
+        timings = {op: events[op][0].elapsed_time(events[op][1]) for op in events.keys()}
+        
+        print(f"[H2O Attention Profiling], input shape: {hidden_states.shape}")
+        print(f"  Total time: {timings['total']:.3f}ms")
+        for op in events.keys():
+            if op != 'total':
+                time = timings[op]
+                percentage = (time / timings['total']) * 100
+                print(f"  {op:12s}: {time:7.3f}ms ({percentage:6.2f}%)")
 
         return attn_output, attn_weights, past_key_value
 
@@ -547,8 +530,6 @@ class H2OLlamaForCausalLM(LlamaForCausalLM):
         num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
             self.model.layers[layer_idx].self_attn = H2OLlamaAttention(config)
-
-
 
 ## H2O KV Cache dropping with Position rolling
 class H2OLlamaAttention_streaming(nn.Module):

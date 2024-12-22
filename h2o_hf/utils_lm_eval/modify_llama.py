@@ -13,16 +13,12 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding, LlamaAttention, apply_rotary_pos_emb
 
-
 __all__ = ['convert_kvcache_llama_heavy_recent', 'LlamaAttention_heavy_hitter']
 
-
 def local_heavy_hitter_mask(attn_weights, heavy_budget):
-
     # attn_weights (BS, head, query, keys)
     dtype_attn_weights = attn_weights.dtype
     seq_length = attn_weights.shape[-1]
@@ -39,7 +35,6 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
     mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
 
     for token_index in range(heavy_budget+padding_length, seq_length):
-
         tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
         _, tmp_topk_index = accumulated_attention_score.topk(k=heavy_budget-1, dim=-1)
         zeros_index = torch.zeros_like(tmp_attn_index, dtype=torch.bool)
@@ -49,7 +44,6 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         mask_bottom[:,:,token_index,:] = mask_bottom_index
         accumulated_attention_score += tmp_attn_index
         accumulated_attention_score = accumulated_attention_score * mask_bottom_index
-
     return mask_bottom
 
 
@@ -58,6 +52,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
+        print("This confirms you using the modify_llama for H2O attention")
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -77,7 +72,6 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         self.heavy_budget_ratio = config.heavy_ratio
         self.recent_budget_ratio = config.recent_ratio
-
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -110,7 +104,6 @@ class LlamaAttention_heavy_hitter(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
-
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -147,13 +140,13 @@ class LlamaAttention_heavy_hitter(nn.Module):
         # # mask_bottom = ones
         # attn_weights[~mask_bottom] = torch.min(attention_mask)
 
-
-        
         # Heavy Hitter Mask (Based on global statistics)
+        print("Begin debug:")
         tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
         tmp_sum = torch.sum(tmp_attn, dim=-2) 
         _, tmp_topk = tmp_sum.topk(k=heavy_budget, dim=-1)
 
+        print(f"attn_weights: {attn_weights.shape}, tmp_attn: {tmp_attn.shape}, tmp_sum: {tmp_sum.shape}, tmp_topk: {tmp_topk.shape}")
         zeros = torch.zeros_like(tmp_sum, dtype=torch.bool)
         mask_bottom = zeros.scatter(-1, tmp_topk, True).unsqueeze(2)
         mask_bottom = mask_bottom.expand(mask_bottom.shape[0], mask_bottom.shape[1], attn_weights.shape[-2], mask_bottom.shape[-1])
@@ -164,7 +157,6 @@ class LlamaAttention_heavy_hitter(nn.Module):
         mask_bottom = torch.logical_or(mask_bottom, ones)
         # mask_bottom = ones
         attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
-
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -183,7 +175,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-
+        print("End debug:")
         return attn_output, attn_weights, past_key_value
 
 
